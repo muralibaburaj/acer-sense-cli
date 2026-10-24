@@ -1,0 +1,450 @@
+#!/usr/bin/env bash
+#
+# acer: command-line control for Acer Nitro / Predator laptops on Linux.
+#
+# Drives the Linuwu-Sense kernel driver (nitro_sense / predator_sense sysfs)
+# and the standard ACPI platform profile. Commands that need root re-run the
+# write through sudo or doas.
+#
+# https://github.com/muralibaburaj/acer-sense-cli
+#
+set -euo pipefail
+
+VERSION=0.1.0
+
+# ACER_SYSFS_ROOT points everything at a fake /sys tree (used by the tests).
+SYS=${ACER_SYSFS_ROOT:-}/sys
+PROFILE=$SYS/firmware/acpi/platform_profile
+PROFILE_CHOICES=$SYS/firmware/acpi/platform_profile_choices
+WMI=$SYS/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi
+STATE_DIR=${ACER_STATE_DIR:-/var/lib/acer-sense}
+# Settings `acer save` / `acer restore` remember, in restore order.
+SAVED=(platform_profile backlight_timeout usb_charging battery_limiter fan_speed)
+
+die() {
+	printf 'acer: %s\n' "$*" >&2
+	exit 1
+}
+usage_error() {
+	printf 'acer: %s\n' "$*" >&2
+	printf "Run 'acer help' for usage.\n" >&2
+	exit 2
+}
+
+# The driver exposes nitro_sense on Nitro models and predator_sense on
+# Predator models; prefer whichever exists.
+sense_dir() {
+	local d
+	for d in "$WMI/predator_sense" "$WMI/nitro_sense"; do
+		[[ -d $d ]] && {
+			printf '%s\n' "$d"
+			return 0
+		}
+	done
+	return 1
+}
+
+# Kernel-standard battery charge threshold, used for `limit` when the
+# Linuwu-Sense driver isn't loaded.
+charge_threshold() {
+	local f
+	for f in "$SYS"/class/power_supply/BAT*/charge_control_end_threshold; do
+		[[ -e $f ]] && {
+			printf '%s\n' "$f"
+			return 0
+		}
+	done
+	return 1
+}
+
+# Path of a Linuwu-Sense setting, or of the platform profile.
+setting_path() {
+	local dir
+	case $1 in
+	platform_profile) printf '%s\n' "$PROFILE" ;;
+	four_zone_mode | per_zone_mode) printf '%s\n' "$WMI/four_zoned_kb/$1" ;;
+	*)
+		dir=$(sense_dir) || die "the Linuwu-Sense driver (linuwu_sense) is not loaded"
+		printf '%s\n' "$dir/$1"
+		;;
+	esac
+}
+
+read_file() {
+	local value
+	{ IFS= read -r value <"$1"; } 2>/dev/null || return 1
+	printf '%s\n' "$value"
+}
+
+# Writes a value to a sysfs file, escalating with sudo/doas when needed.
+write_file() {
+	local target=$1 value=$2
+	[[ -e $target ]] || die "$target does not exist on this machine"
+	if [[ -w $target ]]; then
+		printf '%s\n' "$value" >"$target"
+	elif ((EUID != 0)) && command -v sudo >/dev/null 2>&1; then
+		printf '%s\n' "$value" | sudo tee "$target" >/dev/null
+	elif ((EUID != 0)) && command -v doas >/dev/null 2>&1; then
+		printf '%s\n' "$value" | doas tee "$target" >/dev/null
+	else
+		die "cannot write $target (need root)"
+	fi
+}
+
+set_setting() {
+	write_file "$(setting_path "$1")" "$2"
+}
+
+on_off() {
+	case ${1-} in
+	on | 1 | yes | true | enable) printf '1\n' ;;
+	off | 0 | no | false | disable) printf '0\n' ;;
+	*) usage_error "expected on or off, got '${1-}'" ;;
+	esac
+}
+
+# ── Status ───────────────────────────────────────────────────────────────
+
+show() {
+	printf '%-20s %s\n' "$1" "$2"
+}
+
+hwmon_dir() {
+	local d
+	for d in "$WMI"/hwmon/hwmon*; do
+		[[ -d $d ]] && {
+			printf '%s\n' "$d"
+			return 0
+		}
+	done
+	return 1
+}
+
+cmd_status() {
+	local dir v hw rpm temps t f model
+	model=$(read_file "$SYS/class/dmi/id/product_name" 2>/dev/null || true)
+	[[ -z $model ]] || show "Model" "$model"
+
+	if v=$(read_file "$PROFILE"); then
+		show "Profile" "$v ($(read_file "$PROFILE_CHOICES" || echo '?'))"
+	fi
+
+	if ! dir=$(sense_dir); then
+		if f=$(charge_threshold); then
+			show "Charge limit" "$(read_file "$f")%"
+		fi
+		printf '\nThe Linuwu-Sense driver is not loaded; only the platform profile\n'
+		printf 'and standard battery threshold are available.\n'
+		return 0
+	fi
+
+	if v=$(read_file "$dir/battery_limiter"); then
+		show "Charge limit" "$([[ $v == 1 ]] && echo 'on (80%)' || echo off)"
+	fi
+	if v=$(read_file "$dir/battery_calibration"); then
+		show "Calibration" "$([[ $v == 1 ]] && echo running || echo off)"
+	fi
+	if v=$(read_file "$dir/fan_speed"); then
+		show "Fan speed" "$(describe_fan "$v")"
+	fi
+	if hw=$(hwmon_dir); then
+		rpm=""
+		[[ -r $hw/fan1_input ]] && rpm+="CPU $(read_file "$hw/fan1_input") rpm"
+		[[ -r $hw/fan2_input ]] && rpm+="${rpm:+, }GPU $(read_file "$hw/fan2_input") rpm"
+		[[ -z $rpm ]] || show "Fans" "$rpm"
+		temps=""
+		for t in "$hw"/temp*_input; do
+			[[ -r $t ]] || continue
+			temps+="${temps:+ / }$(($(read_file "$t") / 1000))"
+		done
+		[[ -z $temps ]] || show "Temperatures" "$temps °C"
+	fi
+	if v=$(read_file "$dir/usb_charging"); then
+		show "USB charging" "$([[ $v == 0 ]] && echo off || echo "on until battery is at $v%")"
+	fi
+	if v=$(read_file "$dir/backlight_timeout"); then
+		show "Backlight timeout" "$([[ $v == 1 ]] && echo 'on (30 s)' || echo off)"
+	fi
+	if v=$(read_file "$dir/lcd_override"); then
+		show "LCD override" "$([[ $v == 1 ]] && echo on || echo off)"
+	fi
+	if v=$(read_file "$dir/boot_animation_sound"); then
+		show "Boot animation" "$([[ $v == 1 ]] && echo on || echo off)"
+	fi
+	if v=$(read_file "$WMI/four_zoned_kb/per_zone_mode"); then
+		show "Keyboard zones" "$v"
+	fi
+	if v=$(read_file "$dir/version"); then
+		show "Driver" "linuwu_sense $v (${dir##*/})"
+	fi
+}
+
+describe_fan() {
+	local cpu=${1%%,*} gpu=${1##*,}
+	fan_word() { [[ $1 == 0 ]] && echo auto || echo "$1%"; }
+	if [[ $cpu == "$gpu" ]]; then
+		fan_word "$cpu"
+	else
+		printf 'CPU %s, GPU %s\n' "$(fan_word "$cpu")" "$(fan_word "$gpu")"
+	fi
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────
+
+cmd_profile() {
+	local want=${1-} choices
+	[[ -e $PROFILE ]] || die "this kernel/firmware has no ACPI platform profile"
+	choices=$(read_file "$PROFILE_CHOICES")
+	if [[ -z $want ]]; then
+		printf '%s\n' "$(read_file "$PROFILE")"
+		return
+	fi
+	# Friendly names: "performance" is balanced-performance on Nitro models
+	# that don't offer a full performance profile; "eco" is low-power.
+	case $want in
+	performance)
+		[[ " $choices " == *" performance "* ]] || want=balanced-performance
+		;;
+	eco) want=low-power ;;
+	esac
+	[[ " $choices " == *" $want "* ]] || die "profile '$want' is not supported here (choices: $choices)"
+	write_file "$PROFILE" "$want"
+	printf 'Profile: %s\n' "$want"
+}
+
+cmd_limit() {
+	local enable=$1 f
+	if sense_dir >/dev/null; then
+		set_setting battery_limiter "$enable"
+	elif f=$(charge_threshold); then
+		write_file "$f" "$([[ $enable == 1 ]] && echo 80 || echo 100)"
+	else
+		die "no battery charge limit control found (load linuwu_sense)"
+	fi
+	if [[ $enable == 1 ]]; then
+		printf '80%% charge limit enabled.\n'
+	else
+		printf '80%% charge limit disabled.\n'
+	fi
+}
+
+fan_pct() {
+	case $1 in
+	auto) printf '0\n' ;;
+	max) printf '100\n' ;;
+	*)
+		[[ $1 =~ ^[0-9]+%?$ ]] || usage_error "fan speed must be auto, max or 1-100, got '$1'"
+		local n=${1%\%}
+		((n >= 0 && n <= 100)) || usage_error "fan speed must be between 0 and 100"
+		printf '%d\n' "$n"
+		;;
+	esac
+}
+
+cmd_fan() {
+	local cpu gpu
+	case $# in
+	0)
+		describe_fan "$(read_file "$(setting_path fan_speed)")"
+		return
+		;;
+	1)
+		if [[ $1 == *,* ]]; then
+			cpu=$(fan_pct "${1%%,*}")
+			gpu=$(fan_pct "${1##*,}")
+		else
+			cpu=$(fan_pct "$1")
+			gpu=$cpu
+		fi
+		;;
+	2)
+		cpu=$(fan_pct "$1")
+		gpu=$(fan_pct "$2")
+		;;
+	*) usage_error "usage: acer fan [auto|max|PCT|CPU,GPU|CPU GPU]" ;;
+	esac
+	set_setting fan_speed "$cpu,$gpu"
+	printf 'Fan speed: %s\n' "$(describe_fan "$cpu,$gpu")"
+}
+
+cmd_usb_charging() {
+	local v=${1-}
+	case $v in
+	'')
+		read_file "$(setting_path usb_charging)"
+		return
+		;;
+	off) v=0 ;;
+	0 | 10 | 20 | 30) ;;
+	*) usage_error "usb-charging takes off, 10, 20 or 30 (battery % to stop at)" ;;
+	esac
+	set_setting usb_charging "$v"
+	if [[ $v == 0 ]]; then
+		printf 'USB charging while off: disabled.\n'
+	else
+		printf 'USB charging while off: until battery reaches %s%%.\n' "$v"
+	fi
+}
+
+cmd_toggle() {
+	local name=$1 label=$2 v
+	shift 2
+	if (($# == 0)); then
+		v=$(read_file "$(setting_path "$name")")
+		[[ $v == 1 ]] && echo on || echo off
+		return
+	fi
+	v=$(on_off "$1")
+	set_setting "$name" "$v"
+	printf '%s: %s\n' "$label" "$([[ $v == 1 ]] && echo on || echo off)"
+}
+
+cmd_rgb() {
+	(($# >= 1 && $# <= 2)) || usage_error "usage: acer rgb COLOR[,COLOR,COLOR,COLOR] [BRIGHTNESS]"
+	local colors=$1 brightness=${2:-100} c
+	IFS=, read -r -a zone <<<"$colors"
+	for c in "${zone[@]}"; do
+		[[ $c =~ ^#?[0-9a-fA-F]{6}$ ]] || usage_error "colors are RRGGBB hex, got '$c'"
+	done
+	case ${#zone[@]} in
+	1) zone=("${zone[0]}" "${zone[0]}" "${zone[0]}" "${zone[0]}") ;;
+	4) ;;
+	*) usage_error "give one color for all zones or four, one per zone" ;;
+	esac
+	if [[ ! $brightness =~ ^[0-9]+$ ]] || ((brightness > 100)); then
+		usage_error "brightness is 0-100"
+	fi
+	local out=""
+	for c in "${zone[@]}"; do out+="${c#\#},"; done
+	set_setting per_zone_mode "$out$brightness"
+	printf 'Keyboard: %s\n' "$out$brightness"
+}
+
+cmd_save() {
+	local name src value dir
+	dir=$STATE_DIR
+	if [[ ! -d $dir ]]; then
+		mkdir -p "$dir" 2>/dev/null || die "cannot create $dir (run as root or set ACER_STATE_DIR)"
+	fi
+	for name in "${SAVED[@]}"; do
+		src=$(setting_path "$name" 2>/dev/null) || continue
+		value=$(read_file "$src") || continue
+		printf '%s\n' "$value" >"$dir/$name.new"
+		mv -f "$dir/$name.new" "$dir/$name"
+	done
+	printf 'Saved settings to %s\n' "$dir"
+}
+
+# Restores saved settings, validating each so a stale or edited state file
+# can't push an out-of-range value into firmware.
+cmd_restore() {
+	local name value target choices
+	[[ -d $STATE_DIR ]] || die "nothing saved in $STATE_DIR"
+	for name in "${SAVED[@]}"; do
+		value=$(read_file "$STATE_DIR/$name") || continue
+		target=$(setting_path "$name" 2>/dev/null) || continue
+		[[ -e $target ]] || continue
+		case "$name:$value" in
+		platform_profile:*)
+			choices=$(read_file "$PROFILE_CHOICES") || continue
+			[[ " $choices " == *" $value "* ]] || continue
+			;;
+		backlight_timeout:[01] | battery_limiter:[01]) ;;
+		usb_charging:0 | usb_charging:10 | usb_charging:20 | usb_charging:30) ;;
+		fan_speed:*)
+			[[ $value =~ ^([0-9]{1,2}|100),([0-9]{1,2}|100)$ ]] || continue
+			;;
+		*) continue ;;
+		esac
+		write_file "$target" "$value" || printf 'acer: could not restore %s=%s\n' "$name" "$value" >&2
+	done
+	printf 'Restored settings from %s\n' "$STATE_DIR"
+}
+
+cmd_raw() {
+	local name=${1-} target
+	[[ -n $name && $name != */* && $name != .* ]] || usage_error "usage: acer raw SETTING [VALUE]"
+	target=$(setting_path "$name")
+	if (($# == 1)); then
+		read_file "$target" || die "cannot read $target"
+	else
+		write_file "$target" "$2"
+	fi
+}
+
+cmd_help() {
+	cat <<'EOF'
+Usage: acer [COMMAND] [ARGS]
+
+Status
+  acer                          show everything (same as `acer status`)
+
+Thermal profile (ACPI platform_profile)
+  acer quiet | balanced | performance | low-power | eco
+  acer profile [NAME]           show or set any profile the firmware offers
+
+Battery
+  acer limit                    stop charging at 80%
+  acer unlimited                charge to 100%
+  acer calibrate start|stop     full charge/discharge calibration (stay on AC)
+
+Fans
+  acer fan                      show the current fan setting
+  acer fan auto | max | PCT     both fans (PCT 1-100; 0 = auto)
+  acer fan CPU,GPU              e.g. acer fan 50,70
+
+Other
+  acer usb-charging [off|10|20|30]       power USB while off until battery %
+  acer backlight-timeout [on|off]        keyboard light off after 30 s idle
+  acer lcd-override [on|off]             lower panel latency (Predator)
+  acer boot-sound [on|off]               boot animation and sound (Predator)
+  acer rgb COLOR[,C2,C3,C4] [BRIGHTNESS] four-zone keyboard, RRGGBB hex
+  acer raw SETTING [VALUE]               read/write any driver sysfs file
+
+Persistence (the driver forgets settings on reboot)
+  acer save                     remember profile, fans, limits (as root)
+  acer restore                  re-apply them, e.g. from a boot service
+
+  acer help | --version
+
+Writes use sudo or doas automatically when not run as root. The state
+directory for save/restore is /var/lib/acer-sense (ACER_STATE_DIR).
+Requires the Linuwu-Sense driver: https://github.com/PXDiv/Div-Linuwu-Sense
+EOF
+}
+
+main() {
+	local cmd=${1:-status}
+	(($#)) && shift
+	case $cmd in
+	status) cmd_status ;;
+	quiet | balanced | low-power | balanced-performance | performance | eco | cool)
+		(($# == 0)) || usage_error "'$cmd' takes no arguments"
+		cmd_profile "$cmd"
+		;;
+	profile) cmd_profile "$@" ;;
+	limit) cmd_limit 1 ;;
+	unlimited | nolimit) cmd_limit 0 ;;
+	calibrate)
+		case ${1-} in
+		start) set_setting battery_calibration 1 && echo "Calibration started; keep the charger connected." ;;
+		stop) set_setting battery_calibration 0 && echo "Calibration stopped." ;;
+		*) usage_error "usage: acer calibrate start|stop" ;;
+		esac
+		;;
+	fan | fans) cmd_fan "$@" ;;
+	usb-charging) cmd_usb_charging "$@" ;;
+	backlight-timeout) cmd_toggle backlight_timeout "Backlight timeout" "$@" ;;
+	lcd-override) cmd_toggle lcd_override "LCD override" "$@" ;;
+	boot-sound) cmd_toggle boot_animation_sound "Boot animation" "$@" ;;
+	rgb) cmd_rgb "$@" ;;
+	save) cmd_save ;;
+	restore) cmd_restore ;;
+	raw) cmd_raw "$@" ;;
+	help | -h | --help) cmd_help ;;
+	version | -V | --version) printf 'acer %s\n' "$VERSION" ;;
+	*) usage_error "unknown command '$cmd'" ;;
+	esac
+}
+
+main "$@"

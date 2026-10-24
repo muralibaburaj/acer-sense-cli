@@ -1,0 +1,15 @@
+[Unit]
+Description=Restore Acer Sense settings (profile, fans, charge limit)
+Documentation=https://github.com/muralibaburaj/acer-sense-cli
+After=systemd-modules-load.service power-profiles-daemon.service
+ConditionPathExists=/sys/module/linuwu_sense
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StateDirectory=acer-sense
+ExecStart=@BIN@ restore
+ExecStop=@BIN@ save
+
+[Install]
+WantedBy=multi-user.target
