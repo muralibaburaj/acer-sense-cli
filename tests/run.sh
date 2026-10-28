@@ -29,7 +29,7 @@ val() { cat "$root/sys/$1"; }
 
 mkfake() {
 	rm -rf "$root/sys" "$root/state"
-	local s=$root/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/${1:-nitro_sense}
+	local s=$root/sys/module/${3:-linuwu_sense}/drivers/platform:acer-wmi/acer-wmi/${1:-nitro_sense}
 	mkdir -p "$s" "$root/sys/firmware/acpi" "$root/sys/class/dmi/id"
 	echo "${2:-low-power quiet balanced balanced-performance}" >"$root/sys/firmware/acpi/platform_profile_choices"
 	echo balanced >"$root/sys/firmware/acpi/platform_profile"
@@ -53,6 +53,24 @@ fails_with "unsupported profile is refused" profile turbo
 mkfake "" "low-power balanced performance"
 "$acer" performance >/dev/null
 check "performance used when offered" performance "$(val $P)"
+
+# Firmware that lists "performance" but rejects the write (needs a non-root
+# user, so the write goes through the fake sudo below).
+if ((EUID != 0)); then
+	mkfake "" "low-power balanced balanced-performance performance"
+	mkdir "$root/bin"
+	# Fake sudo: rejects "performance", otherwise writes as the owner would be allowed to.
+	printf '#!/bin/sh\nread -r v\n[ "$v" = performance ] && exit 1\nchmod u+w "$2"\nprintf "%%s\\n" "$v" | "$@"\n' >"$root/bin/sudo"
+	chmod +x "$root/bin/sudo"
+	chmod a-w "$root/sys/$P"
+	PATH=$root/bin:$PATH "$acer" performance >/dev/null 2>&1
+	check "rejected performance falls back to balanced-performance" balanced-performance "$(val $P)"
+fi
+
+# DKMS packages that patch acer_wmi in place instead of adding linuwu_sense.
+mkfake nitro_sense "" acer_wmi
+"$acer" limit >/dev/null
+check "limit via patched acer_wmi" 1 "$(val module/acer_wmi/drivers/platform:acer-wmi/acer-wmi/nitro_sense/battery_limiter)"
 
 mkfake
 "$acer" limit >/dev/null

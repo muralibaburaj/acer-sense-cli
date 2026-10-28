@@ -32,6 +32,9 @@ $ acer limit
   (`linuwu_sense`), with the stock `acer_wmi` module blacklisted, as its README
   describes. Without it, only `acer profile` and (on kernels that expose
   `charge_control_end_threshold`) `acer limit` work.
+  Packages that patch `acer_wmi` in place instead of adding `linuwu_sense`
+  (such as `acer-wmi-linuwu-dkms-git` on the AUR) work too; no blacklist is
+  needed for those.
 - bash 4+, coreutils, and sudo or doas for writes when not run as root.
 
 Tested on a Nitro V 15 (ANV15-51). Predator models use the `predator_sense`
@@ -58,7 +61,7 @@ nix profile install github:muralibaburaj/acer-sense-cli
 | Command | Does |
 |---|---|
 | `acer` / `acer status` | show everything |
-| `acer quiet` · `balanced` · `performance` · `low-power` / `eco` | thermal profile (`performance` maps to `balanced-performance` on models without a full performance profile) |
+| `acer quiet` · `balanced` · `performance` · `low-power` / `eco` | thermal profile (`performance` maps to `balanced-performance` on models without a full performance profile, or whose firmware rejects it) |
 | `acer profile [NAME]` | show or set any profile in `platform_profile_choices` |
 | `acer limit` / `acer unlimited` | 80% charge limit on / off |
 | `acer calibrate start\|stop` | battery calibration (keep AC connected) |

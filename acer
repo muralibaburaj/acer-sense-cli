@@ -17,6 +17,11 @@ SYS=${ACER_SYSFS_ROOT:-}/sys
 PROFILE=$SYS/firmware/acpi/platform_profile
 PROFILE_CHOICES=$SYS/firmware/acpi/platform_profile_choices
 WMI=$SYS/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi
+# Some DKMS packages (e.g. acer-wmi-linuwu-dkms-git) patch acer_wmi in place
+# instead of adding a linuwu_sense module; use that when linuwu_sense is absent.
+if [[ ! -d $WMI && -d $SYS/module/acer_wmi/drivers/platform:acer-wmi/acer-wmi ]]; then
+	WMI=$SYS/module/acer_wmi/drivers/platform:acer-wmi/acer-wmi
+fi
 STATE_DIR=${ACER_STATE_DIR:-/var/lib/acer-sense}
 # Settings `acer save` / `acer restore` remember, in restore order.
 SAVED=(platform_profile backlight_timeout usb_charging battery_limiter fan_speed)
@@ -192,7 +197,7 @@ describe_fan() {
 # ── Commands ─────────────────────────────────────────────────────────────
 
 cmd_profile() {
-	local want=${1-} choices
+	local want=${1-} choices written=0
 	[[ -e $PROFILE ]] || die "this kernel/firmware has no ACPI platform profile"
 	choices=$(read_file "$PROFILE_CHOICES")
 	if [[ -z $want ]]; then
@@ -208,7 +213,15 @@ cmd_profile() {
 	eco) want=low-power ;;
 	esac
 	[[ " $choices " == *" $want "* ]] || die "profile '$want' is not supported here (choices: $choices)"
-	write_file "$PROFILE" "$want"
+	# Some firmware lists "performance" but rejects it (I/O error); settle for
+	# balanced-performance instead of failing.
+	if [[ $want == performance && " $choices " == *" balanced-performance "* ]]; then
+		(write_file "$PROFILE" "$want") 2>/dev/null && written=1 || {
+			printf 'acer: firmware rejected performance; using balanced-performance\n' >&2
+			want=balanced-performance
+		}
+	fi
+	((written)) || write_file "$PROFILE" "$want"
 	printf 'Profile: %s\n' "$want"
 }
 
